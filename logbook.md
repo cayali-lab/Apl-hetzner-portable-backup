@@ -1,60 +1,189 @@
 
+
+---
+
 ```md
-# Task 01 – Hetzner Backup & Restoration Logbook
+# Hetzner → VirtualBox Migration Guide  
 **Author:** Group 2 
 **Project:** Alienable Backup of Hetzner Cloud Server  
 **Environment:** Ubuntu 24.04 (Hetzner → VirtualBox)  
-**Status:** In Progress  
+**Status:** Work in Progress  
 
 ---
 
-## 1. Objective
-Create a fully alienable backup of a Hetzner Cloud server that can be:
+# 1. Overview
+This guide documents the complete process used to:
 
-- Generated directly from the Hetzner instance  
-- Downloaded as a file  
-- Restored on a non-Hetzner environment (VirtualBox)  
-- Booted and used with minimal configuration changes  
-- Capable of running the original software (WordPress)
+1. Access a Hetzner Cloud server  
+2. Create a raw disk image from the running system  
+3. Compress and download the image  
+4. Convert the image into a VirtualBox‑compatible format  
+5. Boot the cloned system locally  
+6. Fix networking, MySQL, Apache, and WordPress redirections  
 
----
-
-## 2. Access to the Cloned Server
-After restoring the disk image into a VirtualBox VM:
-
-- Network configured in bridged mode  
-- SSH access restored  
-- Root login enabled temporarily for recovery  
-- Verified that the system boots correctly outside Hetzner  
+The goal is to produce an **alienable backup** that can run outside Hetzner with minimal adjustments.
 
 ---
 
-## 3. Service Stack Verification
-Checked which services were active on the cloned machine:
+# 2. Accessing the Hetzner Server
 
-| Service | Status | Notes |
-|--------|--------|-------|
-| Apache2 | Running | Primary web server |
-| MySQL | Running | Contains `wordpress` database |
-| Nginx | Not installed | Not required |
-| MariaDB | Not installed | MySQL used instead |
+### 2.1. SSH Access
+Hetzner provides SSH keys for root access.
 
----
-
-## 4. WordPress Database Recovery
-The cloned server contained the original WordPress database:
-
-```
-information_schema
-mysql
-performance_schema
-sys
-wordpress   ← original DB found
+```bash
+ssh -i <your_key>.pem root@<hetzner_public_ip>
 ```
 
-However, the WordPress MySQL user was missing, causing WordPress to show the installation screen.
+Example:
 
-### Recreated the missing MySQL user:
+```bash
+ssh -i id_rsa root@wordpress.multinomial.se
+```
+
+Once inside, verify system info:
+
+```bash
+hostnamectl
+lsblk
+df -h
+```
+
+---
+
+# 3. Creating a Raw Disk Image
+
+We create a **bit‑for‑bit clone** of the server’s main disk.
+
+### 3.1. Identify the disk
+```bash
+lsblk
+```
+
+Typical Hetzner disk:
+
+```
+/dev/sda
+```
+
+### 3.2. Create a raw image using `dd`
+```bash
+dd if=/dev/sda of=/root/hetzner.img bs=1M status=progress
+```
+
+This produces:
+
+```
+/root/hetzner.img
+```
+
+### 3.3. Compress the image
+```bash
+gzip /root/hetzner.img
+```
+
+Result:
+
+```
+/root/hetzner.img.gz
+```
+
+---
+
+# 4. Downloading the Image
+
+### 4.1. From your local machine:
+```bash
+scp -i <your_key>.pem root@<hetzner_public_ip>:/root/hetzner.img.gz .
+```
+
+Example:
+
+```bash
+scp -i id_rsa root@wordpress.multinomial.se:/root/hetzner.img.gz .
+```
+
+---
+
+# 5. Preparing the Image for VirtualBox
+
+### 5.1. Decompress the image
+```bash
+gunzip hetzner.img.gz
+```
+
+Now you have:
+
+```
+hetzner.img
+```
+
+### 5.2. Convert RAW → VDI (VirtualBox format)
+```bash
+VBoxManage convertfromraw hetzner.img hetzner.vdi --format VDI
+```
+
+### 5.3. Create a new VM in VirtualBox
+- OS: Linux → Ubuntu (64‑bit)  
+- Disk: Use existing disk → `hetzner.vdi`  
+- Network: **Bridged Adapter** (important for WordPress)  
+
+---
+
+# 6. First Boot Fixes (VirtualBox)
+
+### 6.1. Fix network interface names
+Hetzner uses `ens3`, VirtualBox uses `enp0s3`.
+
+Update Netplan:
+
+```bash
+nano /etc/netplan/*.yaml
+```
+
+Example:
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      dhcp4: true
+```
+
+Apply:
+
+```bash
+netplan apply
+```
+
+### 6.2. Disable cloud-init (Hetzner metadata)
+```bash
+touch /etc/cloud/cloud-init.disabled
+```
+
+---
+
+# 7. Restoring WordPress Functionality
+
+## 7.1. Verify services
+```bash
+systemctl status apache2
+systemctl status mysql
+```
+
+## 7.2. Confirm WordPress database exists
+```bash
+mysql -u root -p -e "SHOW DATABASES;"
+```
+
+Expected:
+
+```
+wordpress
+```
+
+## 7.3. Recreate missing MySQL user
+The cloned system lost the original WordPress MySQL user.
 
 ```sql
 CREATE USER 'wordpress'@'localhost'
@@ -64,28 +193,29 @@ GRANT ALL PRIVILEGES ON wordpress.* TO 'wordpress'@'localhost';
 FLUSH PRIVILEGES;
 ```
 
-Connection test succeeded.
+Test:
+
+```bash
+mysql -u wordpress -p wordpress
+```
 
 ---
 
-## 5. WordPress URL Mismatch
-After restoring DB access, WordPress redirected to:
+# 8. Fixing WordPress URL Redirection
+
+The cloned site kept redirecting to:
 
 ```
 https://wordpress.multinomial.se
 ```
 
-This happened because the original domain was still stored in the database and Apache configuration.
-
-### Updated WordPress URLs:
-
+### 8.1. Update WordPress URLs in the database
 ```sql
 UPDATE wp_options SET option_value='http://10.205.237.137'
 WHERE option_name IN ('siteurl','home');
 ```
 
-### Added forced URL override in `wp-config.php`:
-
+### 8.2. Force URL override in wp-config.php
 ```php
 define('WP_HOME', 'http://10.205.237.137');
 define('WP_SITEURL', 'http://10.205.237.137');
@@ -93,47 +223,48 @@ define('WP_SITEURL', 'http://10.205.237.137');
 
 ---
 
-## 6. Apache Redirection Cleanup
-Apache was still forcing a redirect to the old domain due to leftover Hetzner configs.
+# 9. Removing Apache Redirections
 
-### Files identified:
+Hetzner left behind SSL configs that forced HTTPS redirection.
 
-```
-/etc/apache2/sites-enabled/000-default.conf
-/etc/apache2/sites-enabled/000-default-le-ssl.conf
-```
-
-### Issues found:
-
-- `ServerName wordpress.multinomial.se`
-- Rewrite rules forcing HTTPS redirection
-- Let’s Encrypt SSL config referencing old domain
-
-### Fixes applied:
-
-- Removed SSL VirtualHost symlink:
-
-```
+### 9.1. Remove SSL VirtualHost
+```bash
 rm /etc/apache2/sites-enabled/000-default-le-ssl.conf
 ```
 
-- Cleaned `000-default.conf`:
-  - Removed rewrite rules
-  - Updated ServerName to the VM IP
+### 9.2. Clean HTTP VirtualHost
+Edit:
 
-- Restarted Apache:
+```bash
+nano /etc/apache2/sites-enabled/000-default.conf
+```
+
+Remove:
 
 ```
+ServerName wordpress.multinomial.se
+RewriteCond %{SERVER_NAME} =wordpress.multinomial.se
+RewriteRule ^ https://wordpress.multinomial.se%{REQUEST_URI} [END,NE,R=permanent]
+```
+
+Replace with:
+
+```
+ServerName 10.205.237.137
+```
+
+Restart Apache:
+
+```bash
 systemctl restart apache2
 ```
 
-### Verification:
-
-```
+### 9.3. Verify
+```bash
 curl -I http://10.205.237.137
 ```
 
-Expected output:
+Expected:
 
 ```
 HTTP/1.1 200 OK
@@ -141,22 +272,28 @@ HTTP/1.1 200 OK
 
 ---
 
-## 7. Current Status
-- Server boots correctly in VirtualBox  
-- Apache + MySQL operational  
-- WordPress database restored  
+# 10. Current Status
+
+- Hetzner server successfully cloned  
+- Disk image downloaded and converted  
+- VirtualBox VM boots correctly  
+- Networking fixed  
+- MySQL user restored  
 - WordPress URL corrected  
 - Apache redirections removed  
-- WordPress expected to load from:  
+- WordPress loads from:  
   `http://10.205.237.137`
 
 ---
 
-## 8. Next Steps
-- Final verification of WordPress frontend  
-- Cleanup of cloud-init and Hetzner metadata  
-- Optional: regenerate SSL for local testing  
-- Document full backup → restore procedure  
+# 11. Next Steps
+
+- Clean up Hetzner-specific packages  
+- Regenerate SSL certificates (optional)  
+- Document full backup → restore workflow  
+- Automate the process with a script  
 - Prepare final report for Task 01  
 
 ```
+
+---
